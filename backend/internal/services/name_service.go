@@ -102,6 +102,7 @@ func (nr *NameResolver) preloadAll() {
 		time.Since(start), clustersLoaded, tenantsLoaded)
 
 	nr.preloaded = true
+	log.Println("[INFO] Server preload finished, ready to serve requests")
 }
 
 // preloadClusters loads all clusters into cache
