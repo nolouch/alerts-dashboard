@@ -80,6 +80,28 @@ cp .env.example .env
 # Edit .env and fill in JIRA_SERVER, JIRA_USER, JIRA_TOKEN, etc.
 ```
 
+#### Environment Variables
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `JIRA_SERVER` | Yes | JIRA server URL (e.g., `https://tidb.atlassian.net`) |
+| `JIRA_USER` | Yes | JIRA user email |
+| `JIRA_TOKEN` | Yes | JIRA API token |
+| `PORT` | No | Server port (default: `8818`) |
+| `HOST` | No | Server host (default: empty) |
+| `TIDB_DSN` | No | TiDB connection string for Name Service (cluster/tenant name lookup) |
+
+#### TiDB Name Service (Optional)
+
+The Name Service provides cluster and tenant name resolution by querying TiDB directly. To enable it:
+
+```bash
+# Format: user:password@tcp(host:port)/database?tls=tidb
+export TIDB_DSN="admin:password@tcp(gateway01.us-east-1.prod.aws.tidbcloud.com:4000)/mydb?tls=tidb"
+```
+
+If `TIDB_DSN` is not configured, the service will start normally but name lookup functionality will be unavailable.
+
 ### 3. Running Locally
 
 #### Backend

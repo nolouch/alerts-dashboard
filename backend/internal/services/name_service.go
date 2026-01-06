@@ -1,12 +1,13 @@
 package services
 
 import (
-	"encoding/json"
+	"database/sql"
 	"fmt"
-	"io"
-	"net/http"
+	"strings"
 	"sync"
 	"time"
+
+	"github.com/nolouch/alerts-platform-v2/internal/db"
 )
 
 type NameInfo struct {
@@ -17,15 +18,36 @@ type NameInfo struct {
 	TenantName string `json:"tenantName"`
 }
 
-type nameApiResponse struct {
-	Success bool     `json:"success"`
-	Data    NameInfo `json:"data"`
+type ClusterInfo struct {
+	ClusterID        string
+	ClusterName      string
+	TenantID         string
+	TenantName       string
+	DeployType       string
+	Version          string
+	ClusterLifecycle string
+	CreationDuration string
+	TenantPlan       string
+	Provider         string
+	Region           string
+	ProjectID        string
+	OrgID            string
+	ClusterType      string
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
+}
+
+type TenantInfo struct {
+	TenantID   string
+	TenantName string
+	Kind       string
+	CreatedAt  time.Time
+	UpdatedAt  time.Time
 }
 
 type NameResolver struct {
 	cache      map[string]NameInfo
 	cacheMutex sync.RWMutex
-	client     *http.Client
 }
 
 var (
@@ -37,9 +59,6 @@ func GetNameResolver() *NameResolver {
 	resolverOnce.Do(func() {
 		resolverInstance = &NameResolver{
 			cache: make(map[string]NameInfo),
-			client: &http.Client{
-				Timeout: 2 * time.Second,
-			},
 		}
 	})
 	return resolverInstance
@@ -71,37 +90,199 @@ func (nr *NameResolver) Resolve(id string) (NameInfo, error) {
 	}
 	nr.cacheMutex.RUnlock()
 
-	// Fetch from API
-	// API: http://10.2.8.101:3535/api/name?id={id}
-	url := fmt.Sprintf("http://10.2.8.101:3535/api/name?id=%s", id)
-	resp, err := nr.client.Get(url)
+	// Check if TiDB is available
+	if db.TiDB == nil {
+		return NameInfo{ID: id, Name: id}, fmt.Errorf("TiDB not connected")
+	}
+
+	// First try to find as cluster
+	if clusterInfo, err := nr.getCluster(id); err == nil && clusterInfo != nil {
+		clusterName := clusterInfo.ClusterName
+
+		// Special handling for nextgen-host clusters with empty names
+		if clusterInfo.DeployType == "nextgen-host" && (clusterName == "" || clusterName == id) {
+			if premiumNames, err := nr.getPremiumClusterNamesByParentID(id); err == nil && len(premiumNames) > 0 {
+				meaningfulNames := []string{}
+				for _, name := range premiumNames {
+					name = strings.TrimSpace(name)
+					if name != "" && name != id {
+						meaningfulNames = append(meaningfulNames, name)
+					}
+				}
+				if len(meaningfulNames) > 0 {
+					clusterName = strings.Join(meaningfulNames, ", ")
+				}
+			}
+		}
+
+		result := NameInfo{
+			Type:       "cluster",
+			ID:         id,
+			Name:       clusterName,
+			TenantID:   clusterInfo.TenantID,
+			TenantName: clusterInfo.TenantName,
+		}
+
+		// Update cache
+		nr.cacheMutex.Lock()
+		nr.cache[id] = result
+		nr.cacheMutex.Unlock()
+
+		return result, nil
+	}
+
+	// Then try to find as tenant
+	if tenantInfo, err := nr.getTenant(id); err == nil && tenantInfo != nil {
+		result := NameInfo{
+			Type: "tenant",
+			ID:   id,
+			Name: tenantInfo.TenantName,
+		}
+
+		// Update cache
+		nr.cacheMutex.Lock()
+		nr.cache[id] = result
+		nr.cacheMutex.Unlock()
+
+		return result, nil
+	}
+
+	// Fallback: try simple tenant name
+	if tenantName, err := nr.getTenantName(id); err == nil && tenantName != "" {
+		result := NameInfo{
+			Type: "tenant",
+			ID:   id,
+			Name: tenantName,
+		}
+
+		nr.cacheMutex.Lock()
+		nr.cache[id] = result
+		nr.cacheMutex.Unlock()
+
+		return result, nil
+	}
+
+	// Fallback: try simple cluster name
+	if clusterName, err := nr.getClusterName(id); err == nil && clusterName != "" {
+		result := NameInfo{
+			Type: "cluster",
+			ID:   id,
+			Name: clusterName,
+		}
+
+		nr.cacheMutex.Lock()
+		nr.cache[id] = result
+		nr.cacheMutex.Unlock()
+
+		return result, nil
+	}
+
+	// Not found - return ID as name
+	return NameInfo{ID: id, Name: id}, fmt.Errorf("ID not found: %s", id)
+}
+
+// getCluster retrieves cluster info from database
+func (nr *NameResolver) getCluster(clusterID string) (*ClusterInfo, error) {
+	row := db.TiDB.QueryRow(`
+		SELECT c.cluster_id, c.cluster_name, c.tenant_id,
+		       COALESCE(NULLIF(c.tenant_name, ''), t.tenant_name, '') as tenant_name,
+		       COALESCE(c.deploy_type, '') as deploy_type,
+		       COALESCE(c.version, '') as version,
+		       COALESCE(c.cluster_lifecycle, '') as cluster_lifecycle,
+		       COALESCE(c.creation_duration, '') as creation_duration,
+		       COALESCE(c.tenant_plan, '') as tenant_plan,
+		       COALESCE(c.provider, '') as provider,
+		       COALESCE(c.region, '') as region,
+		       COALESCE(c.project_id, '') as project_id,
+		       COALESCE(c.org_id, '') as org_id,
+		       COALESCE(c.cluster_type, '') as cluster_type,
+		       c.created_at, c.updated_at
+		FROM clusters c
+		LEFT JOIN tenants t ON c.tenant_id = t.tenant_id
+		WHERE c.cluster_id = ?
+	`, clusterID)
+
+	var info ClusterInfo
+	err := row.Scan(&info.ClusterID, &info.ClusterName, &info.TenantID, &info.TenantName,
+		&info.DeployType, &info.Version, &info.ClusterLifecycle, &info.CreationDuration,
+		&info.TenantPlan, &info.Provider, &info.Region, &info.ProjectID, &info.OrgID, &info.ClusterType,
+		&info.CreatedAt, &info.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
 	if err != nil {
-		return NameInfo{ID: id, Name: id}, err // Return ID as name on error fallback? Or just error.
+		return nil, err
 	}
-	defer resp.Body.Close()
+	return &info, nil
+}
 
-	if resp.StatusCode != http.StatusOK {
-		return NameInfo{ID: id, Name: id}, fmt.Errorf("api returned status: %d", resp.StatusCode)
+// getTenant retrieves tenant info from database
+func (nr *NameResolver) getTenant(tenantID string) (*TenantInfo, error) {
+	row := db.TiDB.QueryRow(`
+		SELECT tenant_id, tenant_name, kind, created_at, updated_at
+		FROM tenants WHERE tenant_id = ?
+	`, tenantID)
+
+	var info TenantInfo
+	err := row.Scan(&info.TenantID, &info.TenantName, &info.Kind, &info.CreatedAt, &info.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
 	}
-
-	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return NameInfo{ID: id, Name: id}, err
+		return nil, err
 	}
+	return &info, nil
+}
 
-	var apiResp nameApiResponse
-	if err := json.Unmarshal(body, &apiResp); err != nil {
-		return NameInfo{ID: id, Name: id}, err
+// getClusterName retrieves cluster name by ID
+func (nr *NameResolver) getClusterName(clusterID string) (string, error) {
+	row := db.TiDB.QueryRow(`
+		SELECT cluster_name FROM clusters WHERE cluster_id = ?
+	`, clusterID)
+
+	var name string
+	err := row.Scan(&name)
+	if err == sql.ErrNoRows {
+		return "", nil
 	}
-
-	if !apiResp.Success {
-		return NameInfo{ID: id, Name: id}, fmt.Errorf("api returned success=false")
+	if err != nil {
+		return "", err
 	}
+	return name, nil
+}
 
-	// Update cache
-	nr.cacheMutex.Lock()
-	nr.cache[id] = apiResp.Data
-	nr.cacheMutex.Unlock()
+// getTenantName retrieves tenant name by ID
+func (nr *NameResolver) getTenantName(tenantID string) (string, error) {
+	row := db.TiDB.QueryRow(`
+		SELECT tenant_name FROM tenants WHERE tenant_id = ?
+	`, tenantID)
 
-	return apiResp.Data, nil
+	var name string
+	err := row.Scan(&name)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return name, nil
+}
+
+// getPremiumClusterNamesByParentID retrieves premium cluster names by parent ID
+func (nr *NameResolver) getPremiumClusterNamesByParentID(parentID string) ([]string, error) {
+	rows, err := db.TiDB.Query("SELECT name FROM premium_cluster_details WHERE parent_id = ? AND name != '' ORDER BY created DESC", parentID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var names []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		names = append(names, name)
+	}
+	return names, nil
 }

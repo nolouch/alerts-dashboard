@@ -69,7 +69,7 @@ func main() {
 	// Serve Frontend Static Files (for production/release)
 	// Only serves if "public" directory exists (created by release process)
 	if _, err := os.Stat("./public"); err == nil {
-		log.Println("✅ Detected 'public' directory, serving static files")
+		log.Println("Detected 'public' directory, serving static files")
 		r.Static("/assets", "./public/assets")
 
 		// Serve other root files if needed, or rely on NoRoute for SPA fallthrough
