@@ -3,6 +3,8 @@ package services
 import (
 	"database/sql"
 	"fmt"
+	"log"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -45,9 +47,19 @@ type TenantInfo struct {
 	UpdatedAt  time.Time
 }
 
+// cacheEntry represents a cached item with expiration
+type cacheEntry struct {
+	info      NameInfo
+	notFound  bool      // true if this ID was not found in database
+	timestamp time.Time // when this entry was cached
+}
+
 type NameResolver struct {
-	cache      map[string]NameInfo
-	cacheMutex sync.RWMutex
+	cache        map[string]cacheEntry
+	cacheMutex   sync.RWMutex
+	missLogger   *log.Logger
+	cacheTTL     time.Duration // TTL for cache entries
+	notFoundTTL  time.Duration // TTL for not-found entries (shorter to allow retry)
 }
 
 var (
@@ -58,10 +70,37 @@ var (
 func GetNameResolver() *NameResolver {
 	resolverOnce.Do(func() {
 		resolverInstance = &NameResolver{
-			cache: make(map[string]NameInfo),
+			cache:       make(map[string]cacheEntry),
+			cacheTTL:    24 * time.Hour,     // Cache hits for 24 hours
+			notFoundTTL: 1 * time.Hour,      // Cache misses for 1 hour
 		}
+		resolverInstance.initMissLogger()
 	})
 	return resolverInstance
+}
+
+// initMissLogger initializes a separate logger for cache misses
+func (nr *NameResolver) initMissLogger() {
+	logPath := os.Getenv("NAME_SERVICE_MISS_LOG")
+	if logPath == "" {
+		logPath = "name_service_miss.log"
+	}
+
+	file, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		log.Printf("[WARN] Failed to create name service miss log file: %v, using stderr", err)
+		nr.missLogger = log.New(os.Stderr, "[NAME_MISS] ", log.LstdFlags)
+		return
+	}
+	nr.missLogger = log.New(file, "", log.LstdFlags)
+	log.Printf("[INFO] Name service miss log initialized: %s", logPath)
+}
+
+// logMiss logs a cache miss to the dedicated log file
+func (nr *NameResolver) logMiss(id string, reason string) {
+	if nr.missLogger != nil {
+		nr.missLogger.Printf("ID=%s reason=%s", id, reason)
+	}
 }
 
 func isNumeric(s string) bool {
@@ -73,6 +112,15 @@ func isNumeric(s string) bool {
 	return len(s) > 0
 }
 
+// isEntryValid checks if a cache entry is still valid
+func (nr *NameResolver) isEntryValid(entry cacheEntry) bool {
+	ttl := nr.cacheTTL
+	if entry.notFound {
+		ttl = nr.notFoundTTL
+	}
+	return time.Since(entry.timestamp) < ttl
+}
+
 func (nr *NameResolver) Resolve(id string) (NameInfo, error) {
 	if id == "" {
 		return NameInfo{}, fmt.Errorf("empty id")
@@ -82,16 +130,20 @@ func (nr *NameResolver) Resolve(id string) (NameInfo, error) {
 		return NameInfo{ID: id, Name: id}, nil
 	}
 
-	// Check cache
+	// Check cache (including not-found entries)
 	nr.cacheMutex.RLock()
-	if info, ok := nr.cache[id]; ok {
+	if entry, ok := nr.cache[id]; ok && nr.isEntryValid(entry) {
 		nr.cacheMutex.RUnlock()
-		return info, nil
+		if entry.notFound {
+			return NameInfo{ID: id, Name: id}, fmt.Errorf("ID not found (cached): %s", id)
+		}
+		return entry.info, nil
 	}
 	nr.cacheMutex.RUnlock()
 
 	// Check if TiDB is available
 	if db.TiDB == nil {
+		nr.logMiss(id, "TiDB_not_connected")
 		return NameInfo{ID: id, Name: id}, fmt.Errorf("TiDB not connected")
 	}
 
@@ -125,7 +177,11 @@ func (nr *NameResolver) Resolve(id string) (NameInfo, error) {
 
 		// Update cache
 		nr.cacheMutex.Lock()
-		nr.cache[id] = result
+		nr.cache[id] = cacheEntry{
+			info:      result,
+			notFound:  false,
+			timestamp: time.Now(),
+		}
 		nr.cacheMutex.Unlock()
 
 		return result, nil
@@ -141,7 +197,11 @@ func (nr *NameResolver) Resolve(id string) (NameInfo, error) {
 
 		// Update cache
 		nr.cacheMutex.Lock()
-		nr.cache[id] = result
+		nr.cache[id] = cacheEntry{
+			info:      result,
+			notFound:  false,
+			timestamp: time.Now(),
+		}
 		nr.cacheMutex.Unlock()
 
 		return result, nil
@@ -156,7 +216,11 @@ func (nr *NameResolver) Resolve(id string) (NameInfo, error) {
 		}
 
 		nr.cacheMutex.Lock()
-		nr.cache[id] = result
+		nr.cache[id] = cacheEntry{
+			info:      result,
+			notFound:  false,
+			timestamp: time.Now(),
+		}
 		nr.cacheMutex.Unlock()
 
 		return result, nil
@@ -171,14 +235,84 @@ func (nr *NameResolver) Resolve(id string) (NameInfo, error) {
 		}
 
 		nr.cacheMutex.Lock()
-		nr.cache[id] = result
+		nr.cache[id] = cacheEntry{
+			info:      result,
+			notFound:  false,
+			timestamp: time.Now(),
+		}
 		nr.cacheMutex.Unlock()
 
 		return result, nil
 	}
 
-	// Not found - return ID as name
+	// Not found - cache the miss and log it
+	nr.cacheMutex.Lock()
+	nr.cache[id] = cacheEntry{
+		info:      NameInfo{ID: id, Name: id},
+		notFound:  true,
+		timestamp: time.Now(),
+	}
+	nr.cacheMutex.Unlock()
+
+	nr.logMiss(id, "not_found_in_database")
+
 	return NameInfo{ID: id, Name: id}, fmt.Errorf("ID not found: %s", id)
+}
+
+// GetCacheStats returns cache statistics
+func (nr *NameResolver) GetCacheStats() map[string]interface{} {
+	nr.cacheMutex.RLock()
+	defer nr.cacheMutex.RUnlock()
+
+	total := len(nr.cache)
+	found := 0
+	notFound := 0
+	expired := 0
+
+	for _, entry := range nr.cache {
+		if !nr.isEntryValid(entry) {
+			expired++
+		} else if entry.notFound {
+			notFound++
+		} else {
+			found++
+		}
+	}
+
+	return map[string]interface{}{
+		"total":          total,
+		"found":          found,
+		"not_found":      notFound,
+		"expired":        expired,
+		"cache_ttl":      nr.cacheTTL.String(),
+		"not_found_ttl":  nr.notFoundTTL.String(),
+	}
+}
+
+// ClearCache clears all cache entries
+func (nr *NameResolver) ClearCache() {
+	nr.cacheMutex.Lock()
+	defer nr.cacheMutex.Unlock()
+	nr.cache = make(map[string]cacheEntry)
+	log.Println("[INFO] Name resolver cache cleared")
+}
+
+// CleanExpiredCache removes expired entries from cache
+func (nr *NameResolver) CleanExpiredCache() int {
+	nr.cacheMutex.Lock()
+	defer nr.cacheMutex.Unlock()
+
+	cleaned := 0
+	for id, entry := range nr.cache {
+		if !nr.isEntryValid(entry) {
+			delete(nr.cache, id)
+			cleaned++
+		}
+	}
+	if cleaned > 0 {
+		log.Printf("[INFO] Cleaned %d expired cache entries", cleaned)
+	}
+	return cleaned
 }
 
 // getCluster retrieves cluster info from database
