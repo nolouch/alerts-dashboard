@@ -60,6 +60,7 @@ type NameResolver struct {
 	missLogger   *log.Logger
 	cacheTTL     time.Duration // TTL for cache entries
 	notFoundTTL  time.Duration // TTL for not-found entries (shorter to allow retry)
+	preloaded    bool          // true after preload is complete, cache miss means not found
 }
 
 var (
@@ -75,8 +76,113 @@ func GetNameResolver() *NameResolver {
 			notFoundTTL: 1 * time.Hour,      // Cache misses for 1 hour
 		}
 		resolverInstance.initMissLogger()
+
+		// Preload is enabled by default, set NAME_SERVICE_PRELOAD=false to disable
+		if os.Getenv("NAME_SERVICE_PRELOAD") != "false" {
+			go resolverInstance.preloadAll()
+		}
 	})
 	return resolverInstance
+}
+
+// preloadAll loads all clusters and tenants into cache at startup
+func (nr *NameResolver) preloadAll() {
+	if db.TiDB == nil {
+		log.Println("[WARN] Cannot preload name service: TiDB not connected")
+		return
+	}
+
+	log.Println("[INFO] Starting name service preload...")
+	start := time.Now()
+
+	clustersLoaded := nr.preloadClusters()
+	tenantsLoaded := nr.preloadTenants()
+
+	log.Printf("[INFO] Name service preload completed in %v: %d clusters, %d tenants",
+		time.Since(start), clustersLoaded, tenantsLoaded)
+
+	nr.preloaded = true
+}
+
+// preloadClusters loads all clusters into cache
+func (nr *NameResolver) preloadClusters() int {
+	rows, err := db.TiDB.Query(`
+		SELECT c.cluster_id, c.cluster_name, c.tenant_id,
+		       COALESCE(NULLIF(c.tenant_name, ''), t.tenant_name, '') as tenant_name,
+		       COALESCE(c.deploy_type, '') as deploy_type
+		FROM clusters c
+		LEFT JOIN tenants t ON c.tenant_id = t.tenant_id
+	`)
+	if err != nil {
+		log.Printf("[ERROR] Failed to preload clusters: %v", err)
+		return 0
+	}
+	defer rows.Close()
+
+	count := 0
+	nr.cacheMutex.Lock()
+	defer nr.cacheMutex.Unlock()
+
+	for rows.Next() {
+		var clusterID, clusterName, tenantID, tenantName, deployType string
+		if err := rows.Scan(&clusterID, &clusterName, &tenantID, &tenantName, &deployType); err != nil {
+			log.Printf("[WARN] Failed to scan cluster row: %v", err)
+			continue
+		}
+
+		nr.cache[clusterID] = cacheEntry{
+			info: NameInfo{
+				Type:       "cluster",
+				ID:         clusterID,
+				Name:       clusterName,
+				TenantID:   tenantID,
+				TenantName: tenantName,
+			},
+			notFound:  false,
+			timestamp: time.Now(),
+		}
+		count++
+	}
+
+	return count
+}
+
+// preloadTenants loads all tenants into cache
+func (nr *NameResolver) preloadTenants() int {
+	rows, err := db.TiDB.Query(`SELECT tenant_id, tenant_name FROM tenants`)
+	if err != nil {
+		log.Printf("[ERROR] Failed to preload tenants: %v", err)
+		return 0
+	}
+	defer rows.Close()
+
+	count := 0
+	nr.cacheMutex.Lock()
+	defer nr.cacheMutex.Unlock()
+
+	for rows.Next() {
+		var tenantID, tenantName string
+		if err := rows.Scan(&tenantID, &tenantName); err != nil {
+			log.Printf("[WARN] Failed to scan tenant row: %v", err)
+			continue
+		}
+
+		// Only add if not already in cache (clusters take priority)
+		if _, exists := nr.cache[tenantID]; !exists {
+			nr.cache[tenantID] = cacheEntry{
+				info: NameInfo{
+					Type: "tenant",
+					ID:   tenantID,
+					Name: tenantName,
+				},
+				notFound:  false,
+				timestamp: time.Now(),
+			}
+			count++
+		}
+	}
+
+	return count
 }
 
 // initMissLogger initializes a separate logger for cache misses
@@ -132,19 +238,28 @@ func (nr *NameResolver) Resolve(id string) (NameInfo, error) {
 
 	// Check cache (including not-found entries)
 	nr.cacheMutex.RLock()
-	if entry, ok := nr.cache[id]; ok && nr.isEntryValid(entry) {
-		nr.cacheMutex.RUnlock()
+	entry, ok := nr.cache[id]
+	isValid := ok && nr.isEntryValid(entry)
+	preloaded := nr.preloaded
+	nr.cacheMutex.RUnlock()
+
+	if isValid {
 		if entry.notFound {
-			return NameInfo{ID: id, Name: id}, fmt.Errorf("ID not found (cached): %s", id)
+			return NameInfo{ID: id, Name: id}, nil
 		}
 		return entry.info, nil
 	}
-	nr.cacheMutex.RUnlock()
+
+	// If preloaded, cache miss means not found - return immediately without DB query
+	if preloaded {
+		nr.logMiss(id, "not_in_preloaded_cache")
+		return NameInfo{ID: id, Name: id}, nil
+	}
 
 	// Check if TiDB is available
 	if db.TiDB == nil {
 		nr.logMiss(id, "TiDB_not_connected")
-		return NameInfo{ID: id, Name: id}, fmt.Errorf("TiDB not connected")
+		return NameInfo{ID: id, Name: id}, nil
 	}
 
 	// First try to find as cluster
